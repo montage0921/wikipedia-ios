@@ -90,7 +90,12 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -switch "/Applications/Xcode_${{ inputs.xcode_version }}.app"
+          ls -d /Applications/Xcode*.app
+          WANT="/Applications/Xcode_${{ inputs.xcode_version }}.app"
+          if [ -n "${{ inputs.xcode_version }}" ] && [ -d "$WANT" ]; then XC="$WANT"
+          else XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); fi
+          echo "Using $XC"
+          sudo xcode-select -switch "$XC"
           xcodebuild -version
           mkdir -p "$ART"/{appium,screenshots,reports,logs}
 
@@ -101,20 +106,26 @@ jobs:
         run: scripts/setup_bundle_id ci
 
       - name: Find simulator
-        id: sim
         run: |
           xcrun simctl list runtimes
-          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          OUT=$(xcrun simctl list devices available -j | python3 -c '
           import json,sys
           name="${{ inputs.device_name }}"; ver="${{ inputs.ios_version }}"
-          d=json.load(sys.stdin)["devices"]
-          for rt,devs in d.items():
-              if rt.endswith("iOS-"+ver.replace(".","-")):
-                  for x in devs:
-                      if x["name"]==name and x["isAvailable"]:
-                          print(x["udid"]); sys.exit(0)
-          sys.exit(1)')
-          echo "UDID=$UDID" | tee -a "$GITHUB_ENV"
+          c=[]
+          for rt,devs in json.load(sys.stdin)["devices"].items():
+              if "iOS" not in rt: continue
+              v=rt.split("iOS-")[-1].replace("-",".")
+              k=tuple(int(x) for x in v.split("."))
+              for x in devs:
+                  if x["name"].startswith("iPhone"):
+                      c.append((x["name"]==name and v==ver, k, x["udid"], x["name"], v))
+          c.sort(reverse=True); _,_,u,n,v=c[0]; print(u, v, n)')
+          read UDID PV DN <<< "$OUT"
+          echo "Picked: $DN / iOS $PV / $UDID"
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          echo "SIM_IOS=$PV" >> "$GITHUB_ENV"
+          echo "SIM_NAME=$DN" >> "$GITHUB_ENV"
+         
 
       - name: Build Wikipedia for the iOS Simulator (no code signing)
         run: |
@@ -126,7 +137,7 @@ jobs:
             -derivedDataPath "$DD" \
             -onlyUsePackageVersionsFromResolvedFile -skipPackagePluginValidation -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            2>&1 | tee "$ART/logs/xcodebuild-app.log" | tail -n 40
+            2>&1 | tee "$ART/logs/xcodebuild-app.log" | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
           APP="$DD/Build/Products/${CONFIGURATION}-iphonesimulator/Wikipedia.app"
           test -d "$APP" || { echo "::error::Wikipedia.app not found at $APP"; find "$DD/Build/Products" -maxdepth 2; exit 1; }
           echo "APP_PATH=$APP" >> "$GITHUB_ENV"
@@ -170,8 +181,8 @@ jobs:
       - name: Export values the tests read
         run: |
           {
-            echo "DEVICE_NAME=${{ inputs.device_name }}"
-            echo "PLATFORM_VERSION=${{ inputs.ios_version }}"
+            echo "DEVICE_NAME=$SIM_NAME"
+            echo "PLATFORM_VERSION=$SIM_IOS"
             echo "ARTIFACT_DIR=$ART"
             echo "APPIUM_HOST=127.0.0.1"
             echo "APPIUM_PORT=4723"
