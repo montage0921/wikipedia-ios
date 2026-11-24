@@ -198,10 +198,10 @@ jobs:
       # ---------- built-in smoke test: stdlib-only Python talking W3C WebDriver to Appium ----------
       - name: Smoke test (launch app, screenshot, dump page source)
         if: inputs.test_language == 'smoke'
-        timeout-minutes: 20
+        timeout-minutes: 35
         run: |
           python3 - <<'PY'
-          import base64, json, os, urllib.request, urllib.error
+          import base64, json, os, subprocess, time, urllib.request, urllib.error
           base = os.environ["APPIUM_URL"]; art = os.environ["ARTIFACT_DIR"]
           def call(method, path, body=None):
               req = urllib.request.Request(base + path, method=method,
@@ -225,14 +225,31 @@ jobs:
             "appium:wdaStartupRetries": 2,
             "appium:newCommandTimeout": 300,
             "appium:autoAcceptAlerts": True,
+            # Slow (Intel) runners: don't let WDA launch the app inside session creation
+            # (that has a short internal timeout). We launch it ourselves below.
+            "appium:autoLaunch": False,
           }
           if os.environ.get("USE_PREBUILT_WDA"):
               caps["appium:usePrebuiltWDA"] = True
               caps["appium:derivedDataPath"] = os.environ["WDA_DERIVED_DATA"]
           s = call("POST", "/session", {"capabilities": {"alwaysMatch": caps}})
           sid = s["sessionId"]
+          print("Session created:", sid)
           try:
-              import time; time.sleep(8)
+              udid = os.environ["UDID"]; bid = "org.wikimedia.wikipedia"
+              r = subprocess.run(["xcrun", "simctl", "launch", udid, bid], capture_output=True, text=True)
+              print("simctl launch:", r.returncode, r.stdout.strip(), r.stderr.strip())
+              running = False
+              for i in range(18):                      # up to ~3 min for a slow first launch
+                  time.sleep(10)
+                  ps = subprocess.run(["xcrun", "simctl", "spawn", udid, "launchctl", "list"],
+                                      capture_output=True, text=True).stdout
+                  running = bid in ps
+                  print(f"[{(i+1)*10}s] app running: {running}")
+                  if running and i >= 2:
+                      break
+              if not running:
+                  print("::error::Wikipedia is not running after launch - probably crashed. See DiagnosticReports in artifacts.")
               os.makedirs(art + "/smoke", exist_ok=True)
               open(art + "/smoke/page_source.xml", "w").write(call("GET", f"/session/{sid}/source"))
               open(art + "/screenshots/smoke.png", "wb").write(base64.b64decode(call("GET", f"/session/{sid}/screenshot")))
@@ -281,8 +298,23 @@ jobs:
         timeout-minutes: 2
         continue-on-error: true
         run: |
-          echo "===== appium-server.log (last 200 lines) ====="
-          tail -n 200 "$ART/appium/appium-server.log" || true
+          echo "===== appium-server.log (last 200 lines, retries removed) ====="
+          grep -v ECONNREFUSED "$ART/appium/appium-server.log" | tail -n 200 || true
+
+      - name: Collect crash reports + app log
+        if: always()
+        timeout-minutes: 4
+        continue-on-error: true
+        run: |
+          mkdir -p "$ART/crash"
+          find ~/Library/Logs/DiagnosticReports -iname "*Wikipedia*" -exec cp {} "$ART/crash/" \; 2>/dev/null || true
+          ls -la "$ART/crash"
+          for f in "$ART"/crash/*; do if [ -f "$f" ]; then echo "===== $f"; head -n 80 "$f"; fi; done
+          perl -e 'alarm 150; exec @ARGV' xcrun simctl spawn "$UDID" log show --last 15m --style compact \
+            --predicate 'process == "Wikipedia" OR eventMessage CONTAINS "org.wikimedia.wikipedia"' \
+            > "$ART/logs/wikipedia-app.log" 2>&1 || true
+          echo "===== wikipedia-app.log: errors/faults ====="
+          grep -iE "fault|error|crash|terminat|exception" "$ART/logs/wikipedia-app.log" | tail -n 60 || true
 
       # Upload BEFORE the slow simulator-log step, so a hang there can't lose the logs.
       - name: Upload artifacts (logs so far)
