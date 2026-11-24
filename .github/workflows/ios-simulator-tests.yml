@@ -82,6 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+            repository: wikimedia/wikipedia-ios
             ref: ${{ inputs.app_ref }}
 
       # Only when the tests live in another repo. Private repo: add secret TESTS_REPO_TOKEN (fine-grained PAT, Contents: read-only on that repo).
