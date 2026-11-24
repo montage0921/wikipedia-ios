@@ -62,6 +62,10 @@ on:
         description: "Build WebDriverAgent once up front and reuse it (saves time per session)"
         type: boolean
         default: true
+      app_ref:
+        description: "Wikipedia app version to build (tag/branch). releases/2026.10.13 = last one that builds with Xcode 26"
+        type: string
+        default: "releases/2026.10.13"
 
 env:
   SCHEME: Wikipedia
@@ -77,6 +81,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
+        with:
+            ref: ${{ inputs.app_ref }}
 
       # Only when the tests live in another repo. Private repo: add secret TESTS_REPO_TOKEN (fine-grained PAT, Contents: read-only on that repo).
       - name: Check out the separate tests repo
