@@ -47,9 +47,9 @@ on:
         type: string
         default: "26.6"
       runner:
-        description: "Hosted runner label"
+        description: "Hosted runner label (macos-26-intel when arm64 macos-26 has no capacity)"
         type: string
-        default: "macos-26"
+        default: "macos-26-intel"
       appium_version:
         description: "npm version/tag of appium. 'latest' (v4 at time of writing) works with the newest xcuitest driver; use '2' only together with xcuitest_version '9' (older, may lack iOS 26 fixes - UNVERIFIED)"
         type: string
@@ -61,7 +61,7 @@ on:
       prebuild_wda:
         description: "Build WebDriverAgent once up front and reuse it (saves time per session)"
         type: boolean
-        default: true
+        default: false
       app_ref:
         description: "Wikipedia app version to build (tag/branch). releases/2026.10.13 = last one that builds with Xcode 26"
         type: string
@@ -82,8 +82,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-            repository: wikimedia/wikipedia-ios
-            ref: ${{ inputs.app_ref }}
+          repository: wikimedia/wikipedia-ios
+          ref: ${{ inputs.app_ref }}
 
       # Only when the tests live in another repo. Private repo: add secret TESTS_REPO_TOKEN (fine-grained PAT, Contents: read-only on that repo).
       - name: Check out the separate tests repo
@@ -132,7 +132,6 @@ jobs:
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           echo "SIM_IOS=$PV" >> "$GITHUB_ENV"
           echo "SIM_NAME=$DN" >> "$GITHUB_ENV"
-         
 
       - name: Build Wikipedia for the iOS Simulator (no code signing)
         run: |
@@ -199,16 +198,21 @@ jobs:
       # ---------- built-in smoke test: stdlib-only Python talking W3C WebDriver to Appium ----------
       - name: Smoke test (launch app, screenshot, dump page source)
         if: inputs.test_language == 'smoke'
+        timeout-minutes: 20
         run: |
           python3 - <<'PY'
-          import base64, json, os, urllib.request
+          import base64, json, os, urllib.request, urllib.error
           base = os.environ["APPIUM_URL"]; art = os.environ["ARTIFACT_DIR"]
           def call(method, path, body=None):
               req = urllib.request.Request(base + path, method=method,
                   data=json.dumps(body).encode() if body is not None else None,
                   headers={"Content-Type": "application/json"})
-              with urllib.request.urlopen(req, timeout=600) as r:
-                  return json.load(r)["value"]
+              try:
+                  with urllib.request.urlopen(req, timeout=600) as r:
+                      return json.load(r)["value"]
+              except urllib.error.HTTPError as e:
+                  print("APPIUM ERROR:", e.read().decode(errors="replace")[:4000])
+                  raise
           caps = {
             "platformName": "iOS",
             "appium:automationName": "XCUITest",
@@ -272,17 +276,41 @@ jobs:
           mkdir -p "$ART/reports/surefire" && cp -R target/surefire-reports/. "$ART/reports/surefire/" || true
 
       # ---------- always: evidence for debugging ----------
-      - name: Final screenshot + simulator log + WDA/Appium state
-        if: always()
+      - name: Show Appium log on failure
+        if: failure()
+        timeout-minutes: 2
+        continue-on-error: true
         run: |
-          xcrun simctl io "$UDID" screenshot "$ART/screenshots/final-simulator.png" || true
-          xcrun simctl spawn "$UDID" log show --last 10m --style compact > "$ART/logs/simulator-syslog.txt" 2>&1 || true
-          cp -R ~/Library/Logs/CoreSimulator "$ART/logs/CoreSimulator" 2>/dev/null || true
+          echo "===== appium-server.log (last 200 lines) ====="
+          tail -n 200 "$ART/appium/appium-server.log" || true
 
-      - uses: actions/upload-artifact@v7
+      # Upload BEFORE the slow simulator-log step, so a hang there can't lose the logs.
+      - name: Upload artifacts (logs so far)
         if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: ios-test-results
           path: artifacts
-          retention-days: 7   # free plans have 500 MB artifact storage; keep this small
+          retention-days: 7
           if-no-files-found: warn
+
+      - name: Final screenshot + simulator log
+        if: always()
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          # perl alarm = hard time limit per command (macOS has no `timeout`)
+          perl -e 'alarm 60; exec @ARGV' xcrun simctl io "$UDID" screenshot "$ART/screenshots/final-simulator.png" || true
+          perl -e 'alarm 120; exec @ARGV' xcrun simctl spawn "$UDID" log show --last 5m --style compact > "$ART/logs/simulator-syslog.txt" 2>&1 || true
+
+      - name: Upload final screenshot + simulator log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-final-state
+          path: |
+            artifacts/screenshots/final-simulator.png
+            artifacts/logs/simulator-syslog.txt
+          retention-days: 7
+          if-no-files-found: ignore
