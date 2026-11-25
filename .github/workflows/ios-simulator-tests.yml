@@ -19,7 +19,7 @@ on:
         type: string
         default: ui-tests
       tests_dir:
-        description: "typescript only: folder with package.json (relative to the repo root, or to tests_repo if set)"
+        description: "typescript only: folder with package.json (relative to the repo root, or to tests_repo/tests_gitlab if set; '.' = its root)"
         type: string
         default: ui-tests/typescript
       test_command:
@@ -31,7 +31,11 @@ on:
         type: string
         default: ""
       tests_ref:
-        description: "OPTIONAL: branch/tag/SHA of tests_repo (empty = its default branch)"
+        description: "OPTIONAL: branch/tag of tests_repo or tests_gitlab (empty = its default branch)"
+        type: string
+        default: ""
+      tests_gitlab:
+        description: "OPTIONAL: GitLab repo with the tests, host/path without https:// (e.g. gitlab.com/mygroup/wikipedia-appium). Private: add secret GITLAB_TOKEN"
         type: string
         default: ""
       device_name:
@@ -94,6 +98,20 @@ jobs:
           ref: ${{ inputs.tests_ref }}
           token: ${{ secrets.TESTS_REPO_TOKEN || github.token }}
           path: tests-repo
+
+      # Tests in GitLab. Private repo: create a GitLab Project Access Token (role Reporter, scope read_repository)
+      # and save it in this GitHub repo as secret GITLAB_TOKEN. Public GitLab repo: no secret needed.
+      - name: Clone the tests repo from GitLab
+        if: inputs.tests_gitlab != '' && inputs.tests_repo == ''
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GL_REPO: ${{ inputs.tests_gitlab }}
+          GL_REF: ${{ inputs.tests_ref }}
+        run: |
+          GL_REPO="${GL_REPO#https://}"; GL_REPO="${GL_REPO%.git}"
+          if [ -n "$GITLAB_TOKEN" ]; then URL="https://oauth2:${GITLAB_TOKEN}@${GL_REPO}.git"; else URL="https://${GL_REPO}.git"; fi
+          git clone --depth 1 ${GL_REF:+--branch "$GL_REF"} "$URL" tests-repo
+          git -C tests-repo log -1 --oneline
 
       - name: Select Xcode
         run: |
@@ -303,7 +321,7 @@ jobs:
       - name: Run TypeScript tests (npm ci + test command)
         if: inputs.test_language == 'typescript'
         run: |
-          ROOT="${{ inputs.tests_repo != '' && 'tests-repo' || '.' }}"
+          ROOT="${{ (inputs.tests_repo != '' || inputs.tests_gitlab != '') && 'tests-repo' || '.' }}"
           cd "$ROOT/${{ inputs.tests_dir }}"
           pwd; ls
           npm ci
