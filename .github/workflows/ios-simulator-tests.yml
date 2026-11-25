@@ -133,7 +133,9 @@ jobs:
           echo "SIM_IOS=$PV" >> "$GITHUB_ENV"
           echo "SIM_NAME=$DN" >> "$GITHUB_ENV"
 
-      - name: Build Wikipedia for the iOS Simulator (no code signing)
+      # Ad-hoc signing ("-", no Apple account needed). With CODE_SIGNING_ALLOWED=NO the app has NO entitlements,
+      # so the app-group container lookup fails (NOT_CODESIGNED) and Wikipedia crashes with SIGSEGV ~1 s after launch.
+      - name: Build Wikipedia for the iOS Simulator (ad-hoc signed)
         run: |
           set -o pipefail
           xcodebuild build \
@@ -142,10 +144,14 @@ jobs:
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$DD" \
             -onlyUsePackageVersionsFromResolvedFile -skipPackagePluginValidation -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
             2>&1 | tee "$ART/logs/xcodebuild-app.log" | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
           APP="$DD/Build/Products/${CONFIGURATION}-iphonesimulator/Wikipedia.app"
           test -d "$APP" || { echo "::error::Wikipedia.app not found at $APP"; find "$DD/Build/Products" -maxdepth 2; exit 1; }
+          echo "Entitlements baked into the app (must list group.org.wikimedia.wikipedia):"
+          codesign -d --entitlements - "$APP" 2>&1 | grep -iE "application-groups|group\.org\.wikimedia" \
+            || echo "::warning::No app-group entitlement found - the app will probably crash on launch"
           echo "APP_PATH=$APP" >> "$GITHUB_ENV"
 
       - name: Install Appium + XCUITest driver
@@ -239,7 +245,8 @@ jobs:
             "appium:wdaLaunchTimeout": 240000,
             "appium:wdaConnectionTimeout": 240000,
             "appium:wdaStartupRetries": 2,
-            "appium:newCommandTimeout": 300,
+            # Last run the session expired (300 s idle) while the script was still polling simctl.
+            "appium:newCommandTimeout": 1800,
             "appium:autoAcceptAlerts": True,
             # Print WDA's xcodebuild output into the Appium log, so a WDA failure shows its real error.
             "appium:showXcodeLog": True,
@@ -260,23 +267,30 @@ jobs:
               udid = os.environ["UDID"]; bid = "org.wikimedia.wikipedia"
               r = subprocess.run(["xcrun", "simctl", "launch", udid, bid], capture_output=True, text=True)
               print("simctl launch:", r.returncode, r.stdout.strip(), r.stderr.strip())
-              running = False
-              for i in range(18):                      # up to ~3 min for a slow first launch
+              t0 = time.time(); seen = 0; running = False
+              while time.time() - t0 < 120:            # 2 min max; app must stay up for 3 checks in a row
                   time.sleep(10)
                   ps = subprocess.run(["xcrun", "simctl", "spawn", udid, "launchctl", "list"],
                                       capture_output=True, text=True).stdout
                   running = bid in ps
-                  print(f"[{(i+1)*10}s] app running: {running}")
-                  if running and i >= 2:
+                  seen = seen + 1 if running else 0
+                  print(f"[{int(time.time()-t0)}s] app running: {running}")
+                  call("GET", f"/session/{sid}/timeouts")   # keep the Appium session alive while waiting
+                  if seen >= 3:
                       break
-              if not running:
-                  print("::error::Wikipedia is not running after launch - probably crashed. See DiagnosticReports in artifacts.")
               os.makedirs(art + "/smoke", exist_ok=True)
               open(art + "/smoke/page_source.xml", "w").write(call("GET", f"/session/{sid}/source"))
               open(art + "/screenshots/smoke.png", "wb").write(base64.b64decode(call("GET", f"/session/{sid}/screenshot")))
-              print("OK: session started; page source + screenshot saved")
+              print("Page source + screenshot saved")
           finally:
-              call("DELETE", f"/session/{sid}")
+              try:
+                  call("DELETE", f"/session/{sid}")
+              except Exception as e:
+                  print("DELETE session failed (ignored):", e)
+          if not running:
+              print("::error::Wikipedia is not running after launch - it crashed. See artifacts/crash and logs/wikipedia-app.log.")
+              raise SystemExit(1)
+          print("OK: Wikipedia launched and stayed up")
           PY
 
       # ---------- consultant's TypeScript tests (WebdriverIO / any npm script) ----------
@@ -343,6 +357,8 @@ jobs:
             > "$ART/logs/wikipedia-app.log" 2>&1 || true
           echo "===== wikipedia-app.log: errors/faults ====="
           grep -iE "fault|error|crash|terminat|exception" "$ART/logs/wikipedia-app.log" | tail -n 60 || true
+          echo "===== app exits (signal / reason) ====="
+          grep -E "Process exited|pending exit for reason|NOT_CODESIGNED" "$ART/logs/wikipedia-app.log" | tail -n 20 || true
 
       # Upload BEFORE the slow simulator-log step, so a hang there can't lose the logs.
       - name: Upload artifacts (logs so far)
