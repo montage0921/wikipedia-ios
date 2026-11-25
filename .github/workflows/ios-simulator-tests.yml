@@ -59,9 +59,9 @@ on:
         type: string
         default: ""
       prebuild_wda:
-        description: "Build WebDriverAgent once up front and reuse it (saves time per session)"
+        description: "Build WebDriverAgent once up front and reuse it (strongly recommended: building WDA inside session creation timed out on Intel runners)"
         type: boolean
-        default: false
+        default: true
       app_ref:
         description: "Wikipedia app version to build (tag/branch). releases/2026.10.13 = last one that builds with Xcode 26"
         type: string
@@ -157,23 +157,39 @@ jobs:
           appium driver list --installed
 
       # Optional speed-up (verified option names: usePrebuiltWDA + derivedDataPath, appium-xcuitest-driver capabilities doc).
+      # If this fails, sessions fall back to building WDA themselves (slow); the log is in artifacts/logs/xcodebuild-wda.log.
       - name: Prebuild WebDriverAgent
         if: inputs.prebuild_wda
+        timeout-minutes: 30
         continue-on-error: true
         run: |
+          set -o pipefail
           WDA_PROJ=$(find "$HOME/.appium" -name WebDriverAgent.xcodeproj -not -path "*/Pods/*" | head -1)
           echo "WDA project: $WDA_PROJ"
+          test -n "$WDA_PROJ" || { echo "::error::WebDriverAgent.xcodeproj not found under ~/.appium"; exit 1; }
+          START=$(date +%s)
           xcodebuild build-for-testing \
             -project "$WDA_PROJ" -scheme WebDriverAgentRunner \
+            -sdk iphonesimulator \
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath "$WDA_DD" \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$ART/logs/xcodebuild-wda.log" | tail -n 15
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "$ART/logs/xcodebuild-wda.log" | grep -E "error:|\*\* (TEST BUILD|BUILD) (SUCCEEDED|FAILED)"
+          echo "WDA build took $(( $(date +%s) - START ))s"
+          XCTESTRUN=$(find "$WDA_DD/Build/Products" -name "*.xctestrun" | head -1)
+          test -n "$XCTESTRUN" || { echo "::error::WDA built but no .xctestrun found"; find "$WDA_DD/Build/Products" -maxdepth 2; exit 1; }
+          echo "xctestrun: $XCTESTRUN"
+          # Only switch to the prebuilt WDA once it really exists.
           echo "USE_PREBUILT_WDA=1" >> "$GITHUB_ENV"
           echo "WDA_DERIVED_DATA=$WDA_DD" >> "$GITHUB_ENV"
 
-      - name: Boot simulator
+      # Boot WITH the Simulator UI open. Last run, Appium found a headless-booted simulator
+      # and rebooted it with the window visible, which cost ~96 s inside session creation.
+      - name: Boot simulator (UI visible)
         run: |
           xcrun simctl boot "$UDID" || true
+          open -a Simulator --args -CurrentDeviceUDID "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl list devices | grep "$UDID"
 
@@ -198,17 +214,17 @@ jobs:
       # ---------- built-in smoke test: stdlib-only Python talking W3C WebDriver to Appium ----------
       - name: Smoke test (launch app, screenshot, dump page source)
         if: inputs.test_language == 'smoke'
-        timeout-minutes: 35
+        timeout-minutes: 40
         run: |
           python3 - <<'PY'
           import base64, json, os, subprocess, time, urllib.request, urllib.error
           base = os.environ["APPIUM_URL"]; art = os.environ["ARTIFACT_DIR"]
-          def call(method, path, body=None):
+          def call(method, path, body=None, timeout=600):
               req = urllib.request.Request(base + path, method=method,
                   data=json.dumps(body).encode() if body is not None else None,
                   headers={"Content-Type": "application/json"})
               try:
-                  with urllib.request.urlopen(req, timeout=600) as r:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
                       return json.load(r)["value"]
               except urllib.error.HTTPError as e:
                   print("APPIUM ERROR:", e.read().decode(errors="replace")[:4000])
@@ -225,6 +241,8 @@ jobs:
             "appium:wdaStartupRetries": 2,
             "appium:newCommandTimeout": 300,
             "appium:autoAcceptAlerts": True,
+            # Print WDA's xcodebuild output into the Appium log, so a WDA failure shows its real error.
+            "appium:showXcodeLog": True,
             # Slow (Intel) runners: don't let WDA launch the app inside session creation
             # (that has a short internal timeout). We launch it ourselves below.
             "appium:autoLaunch": False,
@@ -232,7 +250,10 @@ jobs:
           if os.environ.get("USE_PREBUILT_WDA"):
               caps["appium:usePrebuiltWDA"] = True
               caps["appium:derivedDataPath"] = os.environ["WDA_DERIVED_DATA"]
-          s = call("POST", "/session", {"capabilities": {"alwaysMatch": caps}})
+          print("Using prebuilt WDA:", bool(os.environ.get("USE_PREBUILT_WDA")))
+          # Session creation (sim setup + app install + WDA start, 2 retries x 240 s) can exceed 10 min,
+          # so the client must wait longer than Appium does, or it gives up first.
+          s = call("POST", "/session", {"capabilities": {"alwaysMatch": caps}}, timeout=1500)
           sid = s["sessionId"]
           print("Session created:", sid)
           try:
@@ -300,6 +321,13 @@ jobs:
         run: |
           echo "===== appium-server.log (last 200 lines, retries removed) ====="
           grep -v ECONNREFUSED "$ART/appium/appium-server.log" | tail -n 200 || true
+          echo "===== WDA-related lines ====="
+          grep -iE "xcodebuild|WebDriverAgent|xctest|Testing failed|error:" "$ART/appium/appium-server.log" | grep -v ECONNREFUSED | tail -n 80 || true
+          if [ -f "$ART/logs/xcodebuild-wda.log" ]; then
+            echo "===== xcodebuild-wda.log (errors + last 40 lines) ====="
+            grep -E "error:" "$ART/logs/xcodebuild-wda.log" | head -n 40 || true
+            tail -n 40 "$ART/logs/xcodebuild-wda.log"
+          fi
 
       - name: Collect crash reports + app log
         if: always()
